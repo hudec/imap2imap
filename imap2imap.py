@@ -10,10 +10,12 @@ import yaml
 import hashlib
 import datetime as dt
 import socket
+import select
 
 from email import policy
 from email.message import EmailMessage
 from email.headerregistry import Address
+from pathlib import Path
 
 # ----------------------------
 # Utilities
@@ -33,27 +35,6 @@ def parse_bool(x, default=False):
 
 def safe_regex(pattern: str):
     return re.compile(pattern, re.IGNORECASE) if pattern else None
-
-def get_text_body(msg: email.message.Message) -> str:
-    if msg.is_multipart():
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            disp = part.get_content_disposition()
-            if ctype == "text/plain" and disp != "attachment":
-                try:
-                    return part.get_content()
-                except Exception:
-                    return part.get_payload(decode=True).decode(errors="ignore")
-        # fallback to first part
-        try:
-            return msg.get_body(preferencelist=("plain", "html")).get_content()
-        except Exception:
-            return msg.as_string()
-    else:
-        try:
-            return msg.get_content()
-        except Exception:
-            return msg.get_payload(decode=True).decode(errors="ignore")
 
 def addr_list(header_val: str) -> str:
     if not header_val:
@@ -143,51 +124,149 @@ class Mitigator:
 # Mailer / IMAP
 # ----------------------------
 
+import ssl
+from email.message import EmailMessage
+from pathlib import Path
+
+def _make_ssl_context(ca_file: str | None) -> ssl.SSLContext:
+    """
+    Create an SSLContext that loads a CA from either PEM (path) or DER (bytes).
+    """
+    ctx = ssl.create_default_context()
+    if not ca_file:
+        return ctx
+
+    data = Path(ca_file).read_bytes()
+    # Try PEM first (path), otherwise load DER as cadata
+    if data.lstrip().startswith(b"-----BEGIN "):
+        ctx.load_verify_locations(cafile=ca_file)
+    else:
+        ctx.load_verify_locations(cadata=data)
+    return ctx
+
+def _get_text_body(msg) -> str:
+    """
+    Extract a readable text body from an email.message.Message.
+    Safe for both multipart and single-part mails.
+    """
+    import email
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = part.get_content_disposition()
+            if ctype == "text/plain" and disp != "attachment":
+                try:
+                    return part.get_content()
+                except Exception:
+                    return part.get_payload(decode=True).decode(errors="ignore")
+        # fallback
+        try:
+            return msg.get_body(preferencelist=("plain", "html")).get_content()
+        except Exception:
+            return msg.as_string()
+    else:
+        try:
+            return msg.get_content()
+        except Exception:
+            return msg.get_payload(decode=True).decode(errors="ignore")
+
+
 class SmtpSender:
-    def __init__(self, cfg, ca_file=None):
+    """
+    SMTP sender with STARTTLS + custom CA and strict fully-qualified From handling.
+
+    Expected config keys under `smtp`:
+      server: SMTP hostname (e.g., "mail.i.cz")
+      port:   587 (default)
+      starttls: true|false (default: true)
+      username: SMTP auth user (e.g., "xgov.alerts")
+      password_env: ENV var name holding the password (default: ALERTS_PASS)
+      from_addr: "xgov.alerts@i.cz"  (RECOMMENDED)
+      domain: "i.cz"                  (used only if from_addr missing; builds username@domain)
+      display_name: "XGov Alerts"     (optional)
+      reply_to: "noc@i.cz"            (optional)
+    """
+
+    def __init__(self, cfg: dict, ca_file: str | None = None, env_getter=None):
+        import os
+        import smtplib
+        self._smtplib = smtplib
+        self._env = env_getter or os.getenv
+
         self.server = cfg.get("server", "mail.i.cz")
         self.port = int(cfg.get("port", 587))
-        self.starttls = parse_bool(cfg.get("starttls", True))
+        self.starttls = str(cfg.get("starttls", True)).lower() in ("1", "true", "yes", "on")
         self.username = cfg.get("username", "")
-        self.from_addr = cfg.get("from_addr", self.username)
-        # If username has no '@' and from_addr missing, derive domain from server (mail.i.cz -> i.cz)
+
+        # Build/validate fully-qualified From:
+        domain = cfg.get("domain")
+        self.from_addr = cfg.get("from_addr") or (f"{self.username}@{domain}" if domain else self.username)
         if "@" not in self.from_addr:
-            parts = self.server.split(".")
-            domain = ".".join(parts[1:]) if len(parts) > 1 else ""
-            if domain:
-                self.from_addr = f"{self.from_addr}@{domain}"
+            raise RuntimeError("smtp.from_addr must be a fully-qualified email address (user@domain)")
+
+        self.display_name = cfg.get("display_name")
+        self.reply_to = cfg.get("reply_to")
+
         pw_env = cfg.get("password_env") or "ALERTS_PASS"
-        self.password = env(pw_env)
+        self.password = self._env(pw_env)
         if not self.password:
             raise RuntimeError(f"Env variable {pw_env} not set for SMTP password")
 
-        # TLS context with custom CA
-        self.context = ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
+        # TLS context (accept PEM or DER CA)
+        self.context = _make_ssl_context(ca_file)
 
-    def send_forward(self, original, to_list, subject_prefix="", add_headers=None):
+    def _header_from(self) -> str:
+        return f'{self.display_name} <{self.from_addr}>' if self.display_name else self.from_addr
+
+    def send_forward(self,
+                     original_msg,
+                     to_list: list[str],
+                     subject_prefix: str = "",
+                     add_headers: dict | None = None):
+        """
+        Forward an email:
+          - plain text body extracted + original attached as message/rfc822
+          - From/Envelope sender = fully qualified address
+        """
         if not to_list:
             return
+
         fwd = EmailMessage()
-        subj = original.get("Subject", "(no subject)")
+        subj = original_msg.get("Subject", "(no subject)")
         fwd["Subject"] = f"{subject_prefix}{subj}" if subject_prefix else subj
-        fwd["From"] = self.from_addr
+        fwd["From"] = self._header_from()
         fwd["To"] = ", ".join(to_list)
-        fwd["X-Original-From"] = original.get("From", "")
-        fwd["X-Original-To"] = original.get("To", "")
-        fwd["X-Original-Date"] = original.get("Date", "")
+        if self.reply_to:
+            fwd["Reply-To"] = self.reply_to
+
+        # Preserve some original headers for traceability
+        fwd["X-Original-From"] = original_msg.get("From", "")
+        fwd["X-Original-To"] = original_msg.get("To", "")
+        fwd["X-Original-Date"] = original_msg.get("Date", "")
+
         if add_headers:
             for k, v in add_headers.items():
                 fwd[k] = v
 
-        # Body + original as rfc822 attachment
-        fwd.set_content(get_text_body(original))
-        fwd.add_attachment(original.as_bytes(), maintype="message", subtype="rfc822", filename="original.eml")
+        # Body + attach full original
+        fwd.set_content(_get_text_body(original_msg))
+        try:
+            fwd.add_attachment(
+                original_msg.as_bytes(),
+                maintype="message",
+                subtype="rfc822",
+                filename="original.eml"
+            )
+        except Exception:
+            # If as_bytes() fails, fall back to no attachment (rare)
+            pass
 
-        with smtplib.SMTP(self.server, self.port, timeout=60) as s:
+        with self._smtplib.SMTP(self.server, self.port, timeout=60) as s:
             if self.starttls:
                 s.starttls(context=self.context)
             s.login(self.username, self.password)
-            # IMPORTANT: set the envelope sender explicitly
+            # envelope sender must be fully-qualified
+            print(f"SMTP using envelope From: {self.from_addr}")
             s.send_message(fwd, from_addr=self.from_addr, to_addrs=to_list)
 
 class ImapClient:
@@ -232,11 +311,9 @@ class ImapClient:
             imap.expunge()
 
     def fetch_unseen(self, handler):
-        """Fetch unseen messages and call handler(msg) -> bool (sent or dropped)."""
         imap = self._connect()
         try:
             typ, data = imap.search(None, "UNSEEN")
-            print("IMAP search response:", typ, data)
             if typ != "OK":
                 return
             for num in data[0].split():
@@ -246,8 +323,11 @@ class ImapClient:
                 raw = msg_data[0][1]
                 msg = email.message_from_bytes(raw, policy=policy.default)
                 sent_or_dropped = handler(msg)
-                # post-process regardless if sent or dropped (you can adjust behavior in handler if needed)
-                self._apply_postprocess(imap, num)
+                if sent_or_dropped:
+                    self._apply_postprocess(imap, num)
+                else:
+                    # avoid hot-loop on a problematic message
+                    time.sleep(self.poll_seconds)
         finally:
             try:
                 imap.close()
@@ -256,43 +336,43 @@ class ImapClient:
             imap.logout()
 
     def idle_loop(self, handler):
-        """Idle if possible; otherwise poll."""
+        """Idle if possible; otherwise poll, with low CPU usage."""
+        backoff = self.poll_seconds
         while True:
             try:
                 if not self.use_idle:
                     raise RuntimeError("IDLE disabled")
+
                 imap = self._connect()
-                # Enter IDLE
+                # enter IDLE
                 tag = imap._new_tag()
                 imap.send(f"{tag} IDLE\r\n".encode())
 
                 start = time.time()
-                while time.time() - start < 29 * 60:  # keep IDLE < 30 min
-                    imap.sock.settimeout(self.poll_seconds)
+                while time.time() - start < 29 * 60:  # refresh before 30m
+                    # block until there is data, otherwise just continue idling
+                    r, _, _ = select.select([imap.sock], [], [], self.poll_seconds)
+                    if not r:
+                        continue
                     try:
                         resp = imap.readline()
                         print("IMAP IDLE response:", resp)
-                        if not resp:
-                            # treat empty read as timeout-equivalent; continue
-                            continue
-                        if b"EXISTS" in resp or b"RECENT" in resp:
-                            # End IDLE to fetch
+                        if resp and (b"EXISTS" in resp or b"RECENT" in resp):
+                            # end IDLE, fetch unseen, re-enter IDLE
                             imap.send(b"DONE\r\n")
-                            # read the completion response (ignore content)
                             try:
                                 imap.sock.settimeout(5)
-                                imap.readline()
+                                imap.readline()  # read completion
                             except Exception:
                                 pass
                             self.fetch_unseen(handler)
-                            # Re-enter IDLE
                             tag = imap._new_tag()
                             imap.send(f"{tag} IDLE\r\n".encode())
                     except (TimeoutError, socket.timeout, OSError):
-                        # benign: no activity within timeout window — just continue IDLE
+                        # benign timeout/no data; keep idling
                         continue
 
-                # exit IDLE cleanly every ~29 min
+                # exit IDLE cleanly
                 try:
                     imap.send(b"DONE\r\n")
                     imap.sock.settimeout(5)
@@ -300,12 +380,13 @@ class ImapClient:
                 except Exception:
                     pass
                 imap.logout()
+                backoff = self.poll_seconds  # reset backoff on success
 
             except Exception as e:
-                # fallback to polling if IDLE fails for any reason
-                print(f"IDLE error {type(e).__name__}: {e}; falling back to poll")
+                print(f"IDLE error {type(e).__name__}: {e}; backing off {backoff}s then polling once")
+                time.sleep(backoff)
                 self.fetch_unseen(handler)
-                time.sleep(self.poll_seconds)
+                backoff = min(backoff * 2, 60)  # cap backoff at 60s
 
 # ----------------------------
 # Orchestrator
