@@ -440,7 +440,7 @@ class App:
         if not to_list:
             return False
         self.smtp.send_forward(
-            original=msg,
+            msg,
             to_list=to_list,
             subject_prefix=decision.get("prefix", ""),
             add_headers=decision.get("headers", {}),
