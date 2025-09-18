@@ -1,463 +1,395 @@
 #!/usr/bin/env python3
-# Author: FL42
-
-"""
-See README.md
-"""
-
-import argparse
-import email
+import os
+import re
+import time
+import ssl
 import imaplib
-import json
-import logging
-import signal
-import threading
-from random import random
-from sys import exit as sys_exit
-from time import sleep, time
-
+import smtplib
+import email
 import yaml
+import hashlib
+import datetime as dt
+import socket
 
-version = "1.0.0"
+from email import policy
+from email.message import EmailMessage
+from email.headerregistry import Address
 
+# ----------------------------
+# Utilities
+# ----------------------------
 
-class Imap2Imap(threading.Thread):
-    """
-    See module docstring
-    """
+def env(name: str, default: str | None = None) -> str | None:
+    v = os.getenv(name, default)
+    return v
 
-    def __init__(self, config_path: str) -> None:
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(tz=dt.timezone.utc)
 
-        # Init from mother class
-        threading.Thread.__init__(self)
+def parse_bool(x, default=False):
+    if x is None: return default
+    if isinstance(x, bool): return x
+    return str(x).strip().lower() in ("1", "true", "yes", "y", "on")
 
-        # Set up logger
-        self.log = logging.getLogger(config_path)
-        self.log.setLevel(logging.INFO)
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(
-            logging.Formatter(
-                fmt="[{}] %(asctime)s:%(levelname)s:%(message)s".format(
-                    config_path
-                ),
-                datefmt='%Y-%m-%d %H:%M:%S'
-            )
-        )
-        self.log.addHandler(stream_handler)
+def safe_regex(pattern: str):
+    return re.compile(pattern, re.IGNORECASE) if pattern else None
 
-        # Initialize vars
-        self.config_path = config_path
-        self.config = None
-        self.base_sleep_time = None
-        # exit event: exit when set
-        self.exit_event = threading.Event()
-        self.watchdog = time()
+def get_text_body(msg: email.message.Message) -> str:
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = part.get_content_disposition()
+            if ctype == "text/plain" and disp != "attachment":
+                try:
+                    return part.get_content()
+                except Exception:
+                    return part.get_payload(decode=True).decode(errors="ignore")
+        # fallback to first part
+        try:
+            return msg.get_body(preferencelist=("plain", "html")).get_content()
+        except Exception:
+            return msg.as_string()
+    else:
+        try:
+            return msg.get_content()
+        except Exception:
+            return msg.get_payload(decode=True).decode(errors="ignore")
 
-        # Imap connections
-        self.src_imap = None
-        self.dest_imap = None
+def addr_list(header_val: str) -> str:
+    if not header_val:
+        return ""
+    return header_val
 
-    def run(self) -> None:
-        """
-        Run method (see threading module)
-        """
+# ----------------------------
+# Rule engine
+# ----------------------------
 
-        # Load config
-        if self.config_path is not None:
-            with open(self.config_path, 'rt') as config_file:
-                self.config = yaml.safe_load(config_file)
-        else:
-            raise Exception('Path to config is required')
+class Rule:
+    def __init__(self, spec: dict):
+        self.name = spec.get("name", "unnamed")
+        cond = spec.get("if", {}) or {}
+        self.from_regex = safe_regex(cond.get("from_regex", ""))
+        self.subject_regex = safe_regex(cond.get("subject_regex", ""))
+        self.body_regex = safe_regex(cond.get("body_regex", ""))
+        self.to_regex = safe_regex(cond.get("to_regex", ""))
 
-        # Set up loglevel
-        self.log.setLevel(
-            logging.DEBUG if self.config['common'].get('debug', False)
-            else logging.INFO
-        )
+        action = spec.get("action", {})
+        if isinstance(action, str):
+            # shorthand: "drop"
+            action = {"type": action}
+        self.action_type = action.get("type", "forward")  # forward | drop
+        self.forward_to = action.get("forward_to", [])
+        self.subject_prefix = action.get("subject_prefix", "")
+        self.add_headers = action.get("add_headers", {}) or {}
 
-        self.base_sleep_time = self.config['common'].get('sleep', None)
-        sleep_var_pct = self.config['common'].get('sleep_var_pct', None)
-        while not self.exit_event.is_set():
-
-            try:
-                success = self.forward(
-                    src_imap_config=self.config['src_imap'],
-                    dest_imap_config=self.config['dest_imap']
-                )
-            except Exception:  # pylint: disable=broad-except
-                self.log.exception("Exception raised during forward()")
-                success = False
-
-            if self.base_sleep_time is None:  # Run only once
-                sys_exit(not success)  # 0 on success
-
-            # Try again after 10s if case of error
-            if not success:
-                sleep(10)
-                continue
-
-            sleep_time = self.base_sleep_time
-            if sleep_var_pct:
-                random_delta = \
-                    (2 * random() - 1.0) * (sleep_var_pct / 100) \
-                    * self.base_sleep_time
-                self.log.debug(
-                    "Adding %.2f seconds for randomness",
-                    random_delta
-                )
-                sleep_time += random_delta
-
-            self.watchdog = time()
-
-            self.log.debug("Waiting %.2f seconds...", sleep_time)
-            self.exit_event.wait(sleep_time)
-        self.log.info("Exited")
-
-    def healthy(self) -> bool:
-        """
-        Return true if the thread is not dead
-        """
-        if self.base_sleep_time:
-            timeout = 3 * self.base_sleep_time
-        else:
-            timeout = 600
-        return time() - self.watchdog < timeout
-
-    def forward(self, src_imap_config, dest_imap_config):
-        """
-        Get emails from IMAP server and
-        forward them to destination IMAP server.
-        Return bool indicating success.
-        """
-
-        self.src_imap = self.setup_imap(src_imap_config)
-        if self.src_imap is not None:
-            self.log.debug("Source IMAP logged")
-        else:
-            self.log.error("Source IMAP failed")
+    def matches(self, msg: email.message.Message, body_cache: dict) -> bool:
+        if self.from_regex and not self.from_regex.search(addr_list(msg.get("From", ""))):
             return False
-        on_success_config = src_imap_config.get('on_success', {})
-
-        # Destination IMAP will be open only if there are messages to forward
-        self.dest_imap = None
-
-        mailbox = src_imap_config.get('mailbox', 'INBOX')
-        message_list = self.get_message_list(self.src_imap, mailbox)
-        if message_list is None:
-            self.log.error("Failed to get list of message")
+        if self.to_regex and not self.to_regex.search(addr_list(msg.get("To", ""))):
             return False
-        self.log.debug("message_list: %s", message_list)
-
-        counter_success = 0
-        counter_failure = 0
-        for msg_id in message_list:
-            # Open connection to destination IMAP server (first time)
-            if self.dest_imap is None:
-                self.dest_imap = self.setup_imap(dest_imap_config)
-                if self.dest_imap is not None:
-                    self.log.debug("Destination IMAP logged")
-                else:
-                    self.log.error("Destination IMAP failed")
-                    return False
-
-            msg = self.fetch_message(self.src_imap, msg_id)
-            if msg is None:
-                self.log.error(
-                    "Error while fetching message %s, continue",
-                    msg_id
-                )
-                counter_failure += 1
-                continue
-
-            self.log.debug(
-                "msg: id: %s, from: %s, to: %s, subject: %s, date: %s",
-                msg_id,
-                msg['From'],
-                msg['To'],
-                msg.get('Subject', '(No subject)'),
-                msg['Date']
-            )
-
-            message_forwarded = self.upload_message(
-                imap=self.dest_imap,
-                msg=msg,
-                mailbox=dest_imap_config.get("mailbox", "INBOX")
-            )
-
-            if message_forwarded:
-                counter_success += 1
-                self.postprocess_message(
-                    self.src_imap,
-                    msg_id,
-                    on_success_config.get('delete_msg', False),
-                    on_success_config.get('move_to_mailbox', 'forwarded'),
-                    on_success_config.get('mark_as_seen', False)
-                )
-            else:
-                counter_failure += 1
-                self.log.error("Failed to forward message %s", msg_id)
-
-            # Update watchdog also for each message processed to avoid timeout for large mailboxes
-            self.watchdog = time()
-
-            if counter_success % 100 == 0 or counter_failure % 100 == 0:
-                self.log.info(
-                    "Successfuly forwarded %d messages (%d failed) over %d so far, continuing...",
-                    counter_success,
-                    counter_failure,
-                    len(message_list)
-                )
-
-        self.src_imap.expunge()
-        self.src_imap.close()
-        self.src_imap.logout()
-        self.log.debug("Source IMAP closed")
-
-        if self.dest_imap is not None:
-            # No need to close() as not select() was run
-            self.dest_imap.logout()
-            self.log.debug("Destination IMAP closed")
-
-        # Use print() to have fully json compliant line (no prefix)
-        print(json.dumps(
-            {
-                "type": "stats",
-                "from": f"{src_imap_config.get('host')}_"
-                        f"{src_imap_config.get('user')}",
-                "to": f"{dest_imap_config.get('host')}_"
-                      f"{dest_imap_config.get('user')}",
-                "forward_success": counter_success,
-                "forward_failure": counter_failure
-            }
-        ))
-
+        if self.subject_regex and not self.subject_regex.search(msg.get("Subject", "") or ""):
+            return False
+        if self.body_regex:
+            body = body_cache.get("body")
+            if body is None:
+                body = get_text_body(msg)
+                body_cache["body"] = body
+            if not self.body_regex.search(body or ""):
+                return False
         return True
 
-    def setup_imap(self, imap_config):
-        """
-        Set up connexion to IMAP server
+# ----------------------------
+# Dedup & rate limit
+# ----------------------------
 
-        Parameter:
-        imap_config:
-            - host: (str) IMAP server hostname
-            - port: (int) Default to 143 if ssl if false,
-                          993 if ssl is true
-            - ssl: (bool) Use SSL (default to True)
-            - user: (str) IMAP username
-            - password: (str) IMAP password
+class Mitigator:
+    def __init__(self, spec: dict):
+        self.window = int(spec.get("deduplicate_window_seconds", 0))
+        self.dedupe_by = spec.get("deduplicate_by", ["From", "Subject"])
+        self.rate_cap = int(spec.get("max_messages_per_minute", 0))
+        self._seen = {}  # hash -> timestamp
+        self._bucket = []  # timestamps of sends in last minute
 
-        Return:
-        (imaplib imap object)
-        or None on error
-        """
+    def dedupe_key(self, msg: email.message.Message) -> str:
+        parts = []
+        for h in self.dedupe_by:
+            parts.append(msg.get(h, ""))
+        h = hashlib.sha256("||".join(parts).encode()).hexdigest()
+        return h
+
+    def allow(self, msg: email.message.Message) -> bool:
+        t = now_utc().timestamp()
+        # dedupe
+        if self.window > 0:
+            key = self.dedupe_key(msg)
+            prev = self._seen.get(key, 0)
+            if t - prev < self.window:
+                return False
+            self._seen[key] = t
+            # cleanup old entries
+            for k, v in list(self._seen.items()):
+                if t - v > self.window:
+                    self._seen.pop(k, None)
+        # rate limit
+        if self.rate_cap > 0:
+            self._bucket.append(t)
+            one_min_ago = t - 60
+            self._bucket = [x for x in self._bucket if x >= one_min_ago]
+            if len(self._bucket) > self.rate_cap:
+                return False
+        return True
+
+# ----------------------------
+# Mailer / IMAP
+# ----------------------------
+
+class SmtpSender:
+    def __init__(self, cfg, ca_file=None):
+        self.server = cfg.get("server", "mail.i.cz")
+        self.port = int(cfg.get("port", 587))
+        self.starttls = parse_bool(cfg.get("starttls", True))
+        self.username = cfg.get("username", "")
+        self.from_addr = cfg.get("from_addr", self.username)
+        # If username has no '@' and from_addr missing, derive domain from server (mail.i.cz -> i.cz)
+        if "@" not in self.from_addr:
+            parts = self.server.split(".")
+            domain = ".".join(parts[1:]) if len(parts) > 1 else ""
+            if domain:
+                self.from_addr = f"{self.from_addr}@{domain}"
+        pw_env = cfg.get("password_env") or "ALERTS_PASS"
+        self.password = env(pw_env)
+        if not self.password:
+            raise RuntimeError(f"Env variable {pw_env} not set for SMTP password")
+
+        # TLS context with custom CA
+        self.context = ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
+
+    def send_forward(self, original, to_list, subject_prefix="", add_headers=None):
+        if not to_list:
+            return
+        fwd = EmailMessage()
+        subj = original.get("Subject", "(no subject)")
+        fwd["Subject"] = f"{subject_prefix}{subj}" if subject_prefix else subj
+        fwd["From"] = self.from_addr
+        fwd["To"] = ", ".join(to_list)
+        fwd["X-Original-From"] = original.get("From", "")
+        fwd["X-Original-To"] = original.get("To", "")
+        fwd["X-Original-Date"] = original.get("Date", "")
+        if add_headers:
+            for k, v in add_headers.items():
+                fwd[k] = v
+
+        # Body + original as rfc822 attachment
+        fwd.set_content(get_text_body(original))
+        fwd.add_attachment(original.as_bytes(), maintype="message", subtype="rfc822", filename="original.eml")
+
+        with smtplib.SMTP(self.server, self.port, timeout=60) as s:
+            if self.starttls:
+                s.starttls(context=self.context)
+            s.login(self.username, self.password)
+            # IMPORTANT: set the envelope sender explicitly
+            s.send_message(fwd, from_addr=self.from_addr, to_addrs=to_list)
+
+class ImapClient:
+    def __init__(self, cfg, ca_file=None):
+        self.server = cfg.get("server", "mail.i.cz")
+        self.port = int(cfg.get("port", 993))
+        self.ssl = parse_bool(cfg.get("ssl", True))
+        self.username = cfg.get("username", "")
+        pw_env = cfg.get("password_env") or "ALERTS_PASS"
+        self.password = env(pw_env)
+        if not self.password:
+            raise RuntimeError(f"Env variable {pw_env} not set for IMAP password")
+        self.mailbox = cfg.get("mailbox", "INBOX")
+        self.poll_seconds = int(cfg.get("poll_seconds", 20))
+        self.use_idle = parse_bool(cfg.get("idle", True))
+        self.post = cfg.get("post_process", {}) or {}
+
+        # SSL context with custom CA
+        self.context = ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
+
+    def _connect(self) -> imaplib.IMAP4:
+        if self.ssl:
+            imap = imaplib.IMAP4_SSL(self.server, self.port, ssl_context=self.context)
+        else:
+            imap = imaplib.IMAP4(self.server, self.port)
+        imap.login(self.username, self.password)
+        imap.select(self.mailbox)
+        return imap
+
+    def _apply_postprocess(self, imap: imaplib.IMAP4, msg_id: bytes):
+        if self.post.get("delete"):
+            imap.store(msg_id, "+FLAGS", r"(\Deleted)")
+            imap.expunge()
+            return
+        if self.post.get("mark_seen", True):
+            imap.store(msg_id, "+FLAGS", r"(\Seen)")
+        move_to = self.post.get("move_to")
+        if move_to:
+            # COPY then delete
+            imap.copy(msg_id, move_to)
+            imap.store(msg_id, "+FLAGS", r"(\Deleted)")
+            imap.expunge()
+
+    def fetch_unseen(self, handler):
+        """Fetch unseen messages and call handler(msg) -> bool (sent or dropped)."""
+        imap = self._connect()
         try:
-            if not imap_config.get('ssl', True):
-                imap = imaplib.IMAP4(
-                    imap_config['host'],
-                    imap_config.get('port', 143)
-                )
-            else:
-                imap = imaplib.IMAP4_SSL(
-                    imap_config['host'],
-                    imap_config.get('port', 993)
-                )
+            typ, data = imap.search(None, "UNSEEN")
+            print("IMAP search response:", typ, data)
+            if typ != "OK":
+                return
+            for num in data[0].split():
+                typ, msg_data = imap.fetch(num, "(RFC822)")
+                if typ != "OK" or not msg_data:
+                    continue
+                raw = msg_data[0][1]
+                msg = email.message_from_bytes(raw, policy=policy.default)
+                sent_or_dropped = handler(msg)
+                # post-process regardless if sent or dropped (you can adjust behavior in handler if needed)
+                self._apply_postprocess(imap, num)
+        finally:
+            try:
+                imap.close()
+            except Exception:
+                pass
+            imap.logout()
 
-            self.log.debug(
-                "Connexion opened to %s (%s)",
-                imap_config['host'],
-                "SSL" if imap_config['ssl'] else "PLAIN"
-            )
+    def idle_loop(self, handler):
+        """Idle if possible; otherwise poll."""
+        while True:
+            try:
+                if not self.use_idle:
+                    raise RuntimeError("IDLE disabled")
+                imap = self._connect()
+                # Enter IDLE
+                tag = imap._new_tag()
+                imap.send(f"{tag} IDLE\r\n".encode())
 
-            typ, data = imap.login(
-                imap_config['user'],
-                imap_config['password']
-            )
-            if typ == 'OK':
-                self.log.debug("IMAP login has succeeded")
-            else:
-                self.log.error("Failed to log in: %s", str(data))
-                return None
+                start = time.time()
+                while time.time() - start < 29 * 60:  # keep IDLE < 30 min
+                    imap.sock.settimeout(self.poll_seconds)
+                    try:
+                        resp = imap.readline()
+                        print("IMAP IDLE response:", resp)
+                        if not resp:
+                            # treat empty read as timeout-equivalent; continue
+                            continue
+                        if b"EXISTS" in resp or b"RECENT" in resp:
+                            # End IDLE to fetch
+                            imap.send(b"DONE\r\n")
+                            # read the completion response (ignore content)
+                            try:
+                                imap.sock.settimeout(5)
+                                imap.readline()
+                            except Exception:
+                                pass
+                            self.fetch_unseen(handler)
+                            # Re-enter IDLE
+                            tag = imap._new_tag()
+                            imap.send(f"{tag} IDLE\r\n".encode())
+                    except (TimeoutError, socket.timeout, OSError):
+                        # benign: no activity within timeout window — just continue IDLE
+                        continue
 
-            return imap
+                # exit IDLE cleanly every ~29 min
+                try:
+                    imap.send(b"DONE\r\n")
+                    imap.sock.settimeout(5)
+                    imap.readline()
+                except Exception:
+                    pass
+                imap.logout()
 
-        except (imaplib.IMAP4.error, OSError) as imap_exception:
-            self.log.exception(imap_exception)
-            return None
+            except Exception as e:
+                # fallback to polling if IDLE fails for any reason
+                print(f"IDLE error {type(e).__name__}: {e}; falling back to poll")
+                self.fetch_unseen(handler)
+                time.sleep(self.poll_seconds)
 
-    def get_message_list(self, imap, mailbox):
-        """
-        Get list of message ID in 'mailbox'
+# ----------------------------
+# Orchestrator
+# ----------------------------
 
-        Parameters:
-        imap: (imaplib.IMAP4) Connection to use
-        mailbox: (str) Mailbox to fetch (e.g. 'INBOX')
+class App:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        ca_file = cfg.get("tls", {}).get("ca_file")
+        self.smtp = SmtpSender(cfg.get("smtp", {}), ca_file=ca_file)
+        self.imap = ImapClient(cfg.get("imap", {}), ca_file=ca_file)
+        self.defaults = cfg.get("forward_defaults", {}) or {}
+        self.default_to = self.defaults.get("to", [])
+        self.default_prefix = self.defaults.get("subject_prefix", "")
+        self.rules = [Rule(r) for r in (cfg.get("rules") or [])]
+        self.mitigator = Mitigator(cfg.get("mitigations", {}) or {})
 
-        Return: (list of str) List of message ID in mailbox
-                or None on error
-        """
+    def decide(self, msg: email.message.Message) -> dict:
+        """Return action dict: {type: 'drop'|'forward', to: [...], prefix: str, headers: {...}}"""
+        body_cache = {}
+        for r in self.rules:
+            try:
+                if r.matches(msg, body_cache):
+                    if r.action_type == "drop":
+                        return {"type": "drop"}
+                    else:
+                        to_list = r.forward_to or self.default_to
+                        return {
+                            "type": "forward",
+                            "to": to_list,
+                            "prefix": r.subject_prefix or self.default_prefix,
+                            "headers": r.add_headers,
+                        }
+            except Exception:
+                # a broken rule shouldn't crash the app; continue
+                continue
+        # default action: forward to default_to if configured, otherwise drop
+        if self.default_to:
+            return {"type": "forward", "to": self.default_to, "prefix": self.default_prefix, "headers": {}}
+        return {"type": "drop"}
 
-        try:
-            typ, data = imap.select(mailbox)
-            if typ == 'OK':
-                self.log.debug("IMAP select '%s' succeeded", mailbox)
-            else:
-                self.log.error("Failed to select '%s': %s", mailbox, data)
-                return None
-
-            typ, data = imap.search(None, 'ALL')
-            if typ == 'OK':
-                self.log.debug("IMAP search on 'ALL' succeeded")
-            else:
-                self.log.error("Failed to search on 'ALL': %s", str(data))
-                return None
-
-            return data[0].split()
-
-        except (imaplib.IMAP4.error, OSError) as imap_exception:
-            self.log.exception(imap_exception)
-            return None
-
-    def fetch_message(self, imap, msg_id):
-        """
-        Fetch message defined by msg_id
-
-        Parameters:
-        imap: (imaplib.IMAP4) Connection to use
-        msg_id: (str) ID of the message to get (index in IMAP server)
-
-        Return:
-        (email.message.Message object) fetched Message
-        or None on error
-        """
-
-        try:
-            typ, data = imap.fetch(msg_id, '(RFC822)')
-            if typ == 'OK':
-                self.log.debug("Message %s fetched", msg_id)
-            else:
-                self.log.error("Failed to fetch message %s", msg_id)
-                return None
-
-            return email.message_from_bytes(data[0][1])
-
-        except (imaplib.IMAP4.error, OSError, MemoryError) as imap_exception:
-            self.log.exception(imap_exception)
-            return None
-
-    def upload_message(self, imap, msg, mailbox):
-        """
-        Upload message to remote IMAP server
-
-        Parameters:
-        imap: (imaplib.IMAP4) Connection to use
-        msg: (bytes) Message to upload
-        mailbox: (str) Destination mailbox
-
-        Return:
-        (bool) Success
-        """
-
-        try:
-            imap.append(
-                mailbox=mailbox,
-                flags='',
-                date_time=imaplib.Time2Internaldate(time()),
-                message=msg.as_bytes()
-            )
-            self.log.debug("Message uploaded")
-            return True
-
-        except (imaplib.IMAP4.error, OSError) as imap_exception:
-            self.log.exception(imap_exception)
-            self.log.error("Failed to upload message")
+    def handle_message(self, msg: email.message.Message) -> bool:
+        print(f"Received message from {msg.get('From')} with subject {msg.get('Subject')}")
+        # mitigations first
+        if not self.mitigator.allow(msg):
             return False
-
-    def postprocess_message(
-            self,
-            imap,
-            msg_id,
-            delete_msg,
-            destination_mailbox,
-            mark_as_seen):
-        """
-        Post process 'msg_id'
-
-        Parameters:
-        imap: (imaplib.IMAP4) Connection to use
-        msg_id: (str) ID of the message (IMAP ID)
-        delete_msg: (bool) Delete message
-        destination_mailbox: (str) Name of the destination mailbox
-                                   or 'None' to do nothing
-        mark_as_seen: (bool) Mark the email as seen
-
-        Return:
-        True on success, else False
-        """
-        if delete_msg and (mark_as_seen or destination_mailbox):
-            self.log.warning(
-                "'delete_msg' takes precedence over "
-                "mark_as_seen and destination_mailbox: "
-                "message will be deleted"
-            )
-
-        try:
-            if delete_msg:
-                imap.store(msg_id, '+FLAGS', '\\Deleted')
-                self.log.debug("Message deleted")
-                return True
-
-            if mark_as_seen:
-                imap.store(msg_id, '+FLAGS', '\\Seen')
-                self.log.debug("Message marked as seen")
-
-            if destination_mailbox is not None:
-                # Use COPY and DELETE as not all servers support MOVE
-                imap.copy(msg_id, destination_mailbox)
-                imap.store(msg_id, '+FLAGS', '\\Deleted')
-                # Expunge will be done later
-                self.log.debug("Message moved to %s", destination_mailbox)
-
-            return True
-
-        except (imaplib.IMAP4.error, OSError) as imap_exception:
-            self.log.exception(imap_exception)
+        decision = self.decide(msg)
+        if decision["type"] == "drop":
             return False
+        to_list = decision["to"]
+        if not to_list:
+            return False
+        self.smtp.send_forward(
+            original=msg,
+            to_list=to_list,
+            subject_prefix=decision.get("prefix", ""),
+            add_headers=decision.get("headers", {}),
+        )
+        return True
 
+    def run(self):
+        prefer_idle = parse_bool(self.cfg.get("imap", {}).get("idle", True))
+        if prefer_idle:
+            self.imap.idle_loop(self.handle_message)
+        else:
+            while True:
+                self.imap.fetch_unseen(self.handle_message)
+                time.sleep(self.imap.poll_seconds)
 
-if __name__ == '__main__':
+# ----------------------------
+# Entry
+# ----------------------------
 
-    # Parse arguments
-    parser = argparse.ArgumentParser(description="IMAP to IMAP forwarder")
-    parser.add_argument(
-        '-c', '--config',
-        help="Path to config file"
-    )
-    args = parser.parse_args()
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="IMAP listener that resends mail via SMTP with rules.")
+    ap.add_argument("-c", "--config", default="config.yaml", help="Path to YAML config")
+    args = ap.parse_args()
 
-    # Print version at startup
-    print("IMAP to IMAP forwarder V{}".format(version))
+    with open(args.config, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
 
-    # Handle signal
-    def exit_gracefully(sigcode, _frame):
-        """
-        Exit immediately gracefully
-        """
-        imap2imap.log.info("Signal %d received", sigcode)
-        imap2imap.log.info("Exiting gracefully now...")
-        imap2imap.exit_event.set()
-        sys_exit(0)
-    signal.signal(signal.SIGINT, exit_gracefully)
-    signal.signal(signal.SIGTERM, exit_gracefully)
+    app = App(cfg)
+    app.run()
 
-    # Start Imap2Imap thread
-    imap2imap = Imap2Imap(
-        config_path=args.config
-    )
-    imap2imap.start()
-
-    while True:
-        if not imap2imap.healthy():
-            print("Thread is not healthy, exiting...")
-            break
-        sleep(60)
-    sys_exit(1)
+if __name__ == "__main__":
+    main()
